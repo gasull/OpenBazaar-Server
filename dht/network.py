@@ -7,6 +7,7 @@ Copyright (c) 2015 OpenBazaar
 
 import pickle
 import httplib
+import random
 from binascii import hexlify
 from twisted.internet.task import LoopingCall
 from twisted.internet import defer, reactor, task
@@ -25,6 +26,9 @@ from dht.crawling import ValueSpiderCrawl
 from dht.crawling import NodeSpiderCrawl
 
 from protos import objects
+
+from config import SEEDS, SEEDS_TESTNET
+from random import shuffle
 
 
 def _anyRespondSuccess(responses):
@@ -45,7 +49,7 @@ class Server(object):
     to start listening as an active node on the network.
     """
 
-    def __init__(self, node, db, ksize=20, alpha=3, storage=None):
+    def __init__(self, node, db, signing_key, ksize=20, alpha=3, storage=None):
         """
         Create a server instance.  This will start listening on the given port.
 
@@ -61,8 +65,9 @@ class Server(object):
         self.log = Logger(system=self)
         self.storage = storage or ForgetfulStorage()
         self.node = node
-        self.protocol = KademliaProtocol(self.node, self.storage, ksize, db)
-        self.refreshLoop = LoopingCall(self.refreshTable).start(3600)
+        self.protocol = KademliaProtocol(self.node, self.storage, ksize, db, signing_key)
+        self.refreshLoop = LoopingCall(self.refreshTable)
+        reactor.callLater(1800, self.refreshLoop.start, 3600)
 
     def listen(self, port):
         """
@@ -80,52 +85,60 @@ class Server(object):
         (per section 2.3 of the paper).
         """
         ds = []
-        for rid in self.protocol.getRefreshIDs():
+        refresh_ids = self.protocol.getRefreshIDs()
+        refresh_ids.append(digest(random.getrandbits(255)))  # random node so we get more diversity
+        for rid in refresh_ids:
             node = Node(rid)
             nearest = self.protocol.router.findNeighbors(node, self.alpha)
             spider = NodeSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
             ds.append(spider.find())
 
         def republishKeys(_):
-            ds = []
-            # Republish keys older than one hour
-            for keyword in self.storage.iterkeys():
-                for k, v in self.storage.iteritems(keyword):
-                    if self.storage.get_ttl(keyword, k) < 601200:
-                        ds.append(self.set(keyword, k, v))
+            self.log.debug("Republishing key/values...")
+            neighbors = self.protocol.router.findNeighbors(self.node, exclude=self.node)
+            for node in neighbors:
+                self.protocol.transferKeyValues(node)
 
         return defer.gatherResults(ds).addCallback(republishKeys)
 
-    def querySeed(self, seed, pubkey):
+    def querySeed(self, list_seed_pubkey):
         """
         Query an HTTP seed and return a `list` if (ip, port) `tuple` pairs.
 
         Args:
-           seed: A `string` consisting of "ip:port" or "hostname:port"
-           pubkey: The hex encoded public key to verify the signature on the response
+            Receives a list of one or more tuples Example [(seed, pubkey)]
+            seed: A `string` consisting of "ip:port" or "hostname:port"
+            pubkey: The hex encoded public key to verify the signature on the response
         """
-        try:
-            self.log.info("querying %s for peers" % seed)
-            nodes = []
-            c = httplib.HTTPConnection(seed)
-            c.request("GET", "/")
-            response = c.getresponse()
-            self.log.debug("Http response from %s: %s, %s" % (seed, response.status, response.reason))
-            data = response.read()
-            reread_data = data.decode("zlib")
-            proto = peers.PeerSeeds()
-            proto.ParseFromString(reread_data)
-            for peer in proto.peer_data:
-                p = peers.PeerData()
-                p.ParseFromString(peer)
-                tup = (str(p.ip_address), p.port)
-                nodes.append(tup)
-            verify_key = nacl.signing.VerifyKey(pubkey, encoder=nacl.encoding.HexEncoder)
-            verify_key.verify("".join(proto.peer_data), proto.signature)
-            self.log.info("%s returned %s addresses" % (seed, len(nodes)))
+
+        nodes = []
+        if not list_seed_pubkey:
+            self.log.error('failed to query seed {0} from ob.cfg'.format(list_seed_pubkey))
             return nodes
-        except Exception, e:
-            self.log.error("failed to query seed: %s" % str(e))
+        else:
+            for sp in list_seed_pubkey:
+                seed, pubkey = sp
+                try:
+                    self.log.info("querying %s for peers" % seed)
+                    c = httplib.HTTPConnection(seed)
+                    c.request("GET", "/")
+                    response = c.getresponse()
+                    self.log.debug("Http response from %s: %s, %s" % (seed, response.status, response.reason))
+                    data = response.read()
+                    reread_data = data.decode("zlib")
+                    proto = peers.PeerSeeds()
+                    proto.ParseFromString(reread_data)
+                    for peer in proto.serializedNode:
+                        n = objects.Node()
+                        n.ParseFromString(peer)
+                        tup = (str(n.nodeAddress.ip), n.nodeAddress.port)
+                        nodes.append(tup)
+                    verify_key = nacl.signing.VerifyKey(pubkey, encoder=nacl.encoding.HexEncoder)
+                    verify_key.verify("".join(proto.serializedNode), proto.signature)
+                    self.log.info("%s returned %s addresses" % (seed, len(nodes)))
+                except Exception, e:
+                    self.log.error("failed to query seed: %s" % str(e))
+            return nodes
 
     def bootstrappableNeighbors(self):
         """
@@ -140,7 +153,7 @@ class Server(object):
         neighbors = self.protocol.router.findNeighbors(self.node)
         return [tuple(n)[-2:] for n in neighbors]
 
-    def bootstrap(self, addrs):
+    def bootstrap(self, addrs, deferred=None):
         """
         Bootstrap the server by connecting to other known nodes in the network.
 
@@ -154,31 +167,51 @@ class Server(object):
             return task.deferLater(reactor, 1, self.bootstrap, addrs)
         self.log.info("bootstrapping with %s addresses, finding neighbors..." % len(addrs))
 
+        if deferred is None:
+            d = defer.Deferred()
+        else:
+            d = deferred
+
         def initTable(results):
-            nodes = []
+            response = False
+            potential_relay_nodes = []
             for addr, result in results.items():
                 if result[0]:
+                    response = True
                     n = objects.Node()
                     try:
                         n.ParseFromString(result[1][0])
-                        pubkey = n.signedPublicKey[len(n.signedPublicKey) - 32:]
-                        verify_key = nacl.signing.VerifyKey(pubkey)
-                        verify_key.verify(n.signedPublicKey)
-                        h = nacl.hash.sha512(n.signedPublicKey)
-                        hash_pow = h[64:128]
+                        h = nacl.hash.sha512(n.publicKey)
+                        hash_pow = h[40:]
                         if int(hash_pow[:6], 16) >= 50 or hexlify(n.guid) != h[:40]:
                             raise Exception('Invalid GUID')
-                        nodes.append(Node(n.guid, addr[0], addr[1], n.signedPublicKey))
+                        node = Node(n.guid, addr[0], addr[1], n.publicKey,
+                                    None if not n.HasField("relayAddress") else
+                                    (n.relayAddress.ip, n.relayAddress.port),
+                                    n.natType,
+                                    n.vendor)
+                        self.protocol.router.addContact(node)
+                        if n.natType == objects.FULL_CONE:
+                            potential_relay_nodes.append((addr[0], addr[1]))
                     except Exception:
                         self.log.warning("bootstrap node returned invalid GUID")
-            spider = NodeSpiderCrawl(self.protocol, self.node, nodes, self.ksize, self.alpha)
-            return spider.find()
+            if not response:
+                if self.protocol.multiplexer.testnet:
+                    self.bootstrap(self.querySeed(SEEDS_TESTNET), d)
+                else:
+                    self.bootstrap(self.querySeed(SEEDS), d)
+                return
+            if len(potential_relay_nodes) > 0 and self.node.nat_type != objects.FULL_CONE:
+                shuffle(potential_relay_nodes)
+                self.node.relay_node = potential_relay_nodes[0]
 
+            d.callback(True)
         ds = {}
         for addr in addrs:
             if addr != (self.node.ip, self.node.port):
-                ds[addr] = self.protocol.ping((addr[0], addr[1]))
-        return deferredDict(ds).addCallback(initTable)
+                ds[addr] = self.protocol.ping(Node(digest("null"), addr[0], addr[1], nat_type=objects.FULL_CONE))
+        deferredDict(ds).addCallback(initTable)
+        return d
 
     def inetVisibleIP(self):
         """
@@ -201,25 +234,27 @@ class Server(object):
             ds.append(self.protocol.stun(neighbor))
         return defer.gatherResults(ds).addCallback(handle)
 
-    def get(self, keyword):
+    def get(self, keyword, save_at_nearest=True):
         """
         Get a key if the network has it.
+
+        Args:
+            keyword = the keyword to save to
+            save_at_nearest = save value at the nearest without value
 
         Returns:
             :class:`None` if not found, the value otherwise.
         """
         dkey = digest(keyword)
-        if self.storage.get(dkey) is not None:
-            return defer.succeed(self.storage.get(dkey))
         node = Node(dkey)
         nearest = self.protocol.router.findNeighbors(node)
         if len(nearest) == 0:
             self.log.warning("there are no known neighbors to get key %s" % dkey.encode('hex'))
             return defer.succeed(None)
-        spider = ValueSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
+        spider = ValueSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha, save_at_nearest)
         return spider.find()
 
-    def set(self, keyword, key, value):
+    def set(self, keyword, key, value, ttl=604800):
         """
         Set the given key/value tuple at the hash of the given keyword.
         All values stored in the DHT are stored as dictionaries of key/value
@@ -243,11 +278,11 @@ class Server(object):
 
         def store(nodes):
             self.log.debug("setting '%s' on %s" % (keyword.encode("hex"), [str(i) for i in nodes]))
-            ds = [self.protocol.callStore(node, keyword, key, value) for node in nodes]
+            ds = [self.protocol.callStore(node, keyword, key, value, ttl) for node in nodes]
 
             keynode = Node(keyword)
             if self.node.distanceTo(keynode) < max([n.distanceTo(keynode) for n in nodes]):
-                self.storage[keyword] = (key, value)
+                self.storage[keyword] = (key, value, ttl)
                 self.log.debug("got a store request from %s, storing value" % str(self.node))
 
             return defer.DeferredList(ds).addCallback(_anyRespondSuccess)
@@ -302,23 +337,35 @@ class Server(object):
         Args:
             guid: the 20 raw bytes representing the guid.
         """
+        self.log.debug("crawling dht to find IP for %s" % guid.encode("hex"))
+
         node_to_find = Node(guid)
+        for connection in self.protocol.multiplexer.values():
+            if connection.handler.node is not None and connection.handler.node.id == node_to_find.id:
+                self.log.debug("%s successfully resolved as %s" % (guid.encode("hex"), connection.handler.node))
+                return defer.succeed(connection.handler.node)
 
         def check_for_node(nodes):
             for node in nodes:
                 if node.id == node_to_find.id:
+                    self.log.debug("%s successfully resolved as %s" % (guid.encode("hex"), node))
                     return node
+            self.log.debug("%s was not found in the dht" % guid.encode("hex"))
             return None
+
         index = self.protocol.router.getBucketFor(node_to_find)
         nodes = self.protocol.router.buckets[index].getNodes()
         for node in nodes:
             if node.id == node_to_find.id:
+                self.log.debug("%s successfully resolved as %s" % (guid.encode("hex"), node))
                 return defer.succeed(node)
+
         nearest = self.protocol.router.findNeighbors(node_to_find)
         if len(nearest) == 0:
             self.log.warning("there are no known neighbors to find node %s" % node_to_find.id.encode("hex"))
             return defer.succeed(None)
-        spider = NodeSpiderCrawl(self.protocol, node_to_find, nearest, self.ksize, self.alpha)
+
+        spider = NodeSpiderCrawl(self.protocol, node_to_find, nearest, self.ksize, self.alpha, True)
         return spider.find().addCallback(check_for_node)
 
     def saveState(self, fname):
@@ -330,7 +377,8 @@ class Server(object):
                 'alpha': self.alpha,
                 'id': self.node.id,
                 'vendor': self.node.vendor,
-                'signed_pubkey': self.node.signed_pubkey,
+                'pubkey': self.node.pubkey,
+                'signing_key': self.protocol.signing_key,
                 'neighbors': self.bootstrappableNeighbors(),
                 'testnet': self.protocol.multiplexer.testnet}
         if len(data['neighbors']) == 0:
@@ -340,7 +388,7 @@ class Server(object):
             pickle.dump(data, f)
 
     @classmethod
-    def loadState(cls, fname, ip_address, port, multiplexer, db, callback=None, storage=None):
+    def loadState(cls, fname, ip_address, port, multiplexer, db, nat_type, relay_node, callback=None, storage=None):
         """
         Load the state of this node (the alpha/ksize/id/immediate neighbors)
         from a cache file with the given fname.
@@ -349,23 +397,19 @@ class Server(object):
             data = pickle.load(f)
         if data['testnet'] != multiplexer.testnet:
             raise Exception('Cache uses wrong network parameters')
-        n = Node(data['id'], ip_address, port, data['signed_pubkey'], data['vendor'])
-        s = Server(n, db, data['ksize'], data['alpha'], storage=storage)
+
+        n = Node(data['id'], ip_address, port, data['pubkey'], relay_node, nat_type, data['vendor'])
+        s = Server(n, db, data['signing_key'], data['ksize'], data['alpha'], storage=storage)
         s.protocol.connect_multiplexer(multiplexer)
         if len(data['neighbors']) > 0:
-            if callback is not None:
-                s.bootstrap(data['neighbors']).addCallback(callback)
-            else:
-                s.bootstrap(data['neighbors'])
+            d = s.bootstrap(data['neighbors'])
         else:
-            # TODO: load seed from config file
-            if callback is not None:
-                s.bootstrap(s.querySeed("seed.openbazaar.org:8080",
-                                        "5b44be5c18ced1bc9400fe5e79c8ab90204f06bebacc04dd9c70a95eaca6e117"))\
-                    .addCallback(callback)
+            if multiplexer.testnet:
+                d = s.bootstrap(s.querySeed(SEEDS_TESTNET))
             else:
-                s.bootstrap(s.querySeed("seed.openbazaar.org:8080",
-                                        "5b44be5c18ced1bc9400fe5e79c8ab90204f06bebacc04dd9c70a95eaca6e117"))
+                d = s.bootstrap(s.querySeed(SEEDS))
+        if callback is not None:
+            d.addCallback(callback)
         return s
 
     def saveStateRegularly(self, fname, frequency=600):
@@ -375,7 +419,7 @@ class Server(object):
 
         Args:
             fname: File name to save retularly to
-            frequencey: Frequency in seconds that the state should be saved.
+            frequency: Frequency in seconds that the state should be saved.
                         By default, 10 minutes.
         """
         loop = LoopingCall(self.saveState, fname)

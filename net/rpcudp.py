@@ -3,20 +3,18 @@ Copyright (c) 2014 Brian Muller
 Copyright (c) 2015 OpenBazaar
 """
 
-import random
 import abc
-import nacl.signing
-import nacl.encoding
-import nacl.hash
-from binascii import hexlify
-from hashlib import sha1
+import random
 from base64 import b64encode
-from twisted.internet import defer, reactor
+from config import PROTOCOL_VERSION
+from dht.node import Node
+from dht.utils import digest
+from hashlib import sha1
 from log import Logger
-from protos.message import Message, Command
-from dht import node
-from constants import PROTOCOL_VERSION, SEED_NODE, SEED_NODE_TESTNET
-from protos.message import NOT_FOUND
+from protos.message import Message, Command, NOT_FOUND, HOLE_PUNCH
+from protos.objects import FULL_CONE, RESTRICTED, SYMMETRIC
+from twisted.internet import defer, reactor
+from txrudp.connection import State
 
 
 class RPCProtocol:
@@ -27,16 +25,16 @@ class RPCProtocol:
     """
     __metaclass__ = abc.ABCMeta
 
-    def __init__(self, sourceNode, router, waitTimeout=5):
+    def __init__(self, sourceNode, router, waitTimeout=30):
         """
         Args:
-            proto: A protobuf `Node` object containing info about this node.
+            sourceNode: A protobuf `Node` object containing info about this node.
             router: A `RoutingTable` object from dht.routing. Implies a `network.Server` object
                     must be started first.
-            waitTimeout: Consider it a connetion failure if no response
-                    within this time window.
-            noisy: Whether or not to log the output for this class.
-            testnet: The network parameters to use.
+            waitTimeout: Timeout for whole messages. Note the txrudp layer has a per-packet
+                    timeout but invalid responses wont trigger it. The waitTimeout on this
+                     layer needs to be long enough to allow whole messages (ex. images) to
+                     transmit.
 
         """
         self.sourceNode = sourceNode
@@ -45,57 +43,27 @@ class RPCProtocol:
         self._outstanding = {}
         self.log = Logger(system=self)
 
-    def receive_message(self, datagram, connection):
-        m = Message()
-        try:
-            m.ParseFromString(datagram)
-            sender = node.Node(m.sender.guid, m.sender.ip, m.sender.port, m.sender.signedPublicKey, m.sender.vendor)
-        except Exception:
-            # If message isn't formatted property then ignore
-            self.log.warning("received unknown message from %s, ignoring" % str(connection.dest_addr))
-            return False
-
-        if m.testnet != self.multiplexer.testnet:
+    def receive_message(self, message, sender, connection, ban_score):
+        if message.testnet != self.multiplexer.testnet:
             self.log.warning("received message from %s with incorrect network parameters." %
                              str(connection.dest_addr))
             connection.shutdown()
             return False
 
-        if m.protoVer < PROTOCOL_VERSION:
-            self.log.warning("received message from %s with incompatible protocol version." %
-                             str(connection.dest_addr))
-            connection.shutdown()
-            return False
+        if sender.vendor:
+            self.multiplexer.vendors[sender.id] = sender
 
-        # Check that the GUID is valid. If not, ignore
-        if self.router.isNewNode(sender):
-            try:
-                pubkey = m.sender.signedPublicKey[len(m.sender.signedPublicKey) - 32:]
-                verify_key = nacl.signing.VerifyKey(pubkey)
-                verify_key.verify(m.sender.signedPublicKey)
-                h = nacl.hash.sha512(m.sender.signedPublicKey)
-                pow_hash = h[64:128]
-                if int(pow_hash[:6], 16) >= 50 or hexlify(m.sender.guid) != h[:40]:
-                    raise Exception('Invalid GUID')
-
-            except Exception:
-                self.log.warning("received message from sender with invalid GUID, ignoring")
-                connection.shutdown()
-                return False
-
-        if m.sender.vendor:
-            self.db.VendorStore().save_vendor(m.sender.guid.encode("hex"), m.sender.ip,
-                                              m.sender.port, m.sender.signedPublicKey)
-
-        msgID = m.messageID
-        if m.command == NOT_FOUND:
+        msgID = message.messageID
+        if message.command == NOT_FOUND:
             data = None
         else:
-            data = tuple(m.arguments)
+            data = tuple(message.arguments)
         if msgID in self._outstanding:
             self._acceptResponse(msgID, data, sender)
-        elif m.command != NOT_FOUND:
-            self._acceptRequest(msgID, str(Command.Name(m.command)).lower(), data, sender, connection)
+        elif message.command != NOT_FOUND:
+            ban_score.process_message(connection.dest_addr, message)
+            self._acceptRequest(msgID, str(Command.Name(message.command)).lower(), data, sender, connection)
+
 
     def _acceptResponse(self, msgID, data, sender):
         if data is not None:
@@ -121,6 +89,7 @@ class RPCProtocol:
         else:
             d = defer.maybeDeferred(f, sender, *args)
             d.addCallback(self._sendResponse, funcname, msgID, sender, connection)
+            d.addErrback(self._sendResponse, "bad_request", msgID, sender, connection)
 
     def _sendResponse(self, response, funcname, msgID, sender, connection):
         self.log.debug("sending response for msg id %s to %s" % (b64encode(msgID), sender))
@@ -133,22 +102,31 @@ class RPCProtocol:
             m.command = NOT_FOUND
         else:
             m.command = Command.Value(funcname.upper())
+            if not isinstance(response, list):
+                response = [response]
             for arg in response:
                 m.arguments.append(str(arg))
-        data = m.SerializeToString()
-        connection.send_message(data)
+        m.signature = self.signing_key.sign(m.SerializeToString())[:64]
+        connection.send_message(m.SerializeToString())
 
-    def timeout(self, address, node_to_remove):
+    def timeout(self, node):
         """
         This timeout is called by the txrudp connection handler. We will run through the
         outstanding messages and callback false on any waiting on this IP address.
         """
-        if node_to_remove is not None:
-            self.router.removeContact(node_to_remove)
+        address = (node.ip, node.port)
         for msgID, val in self._outstanding.items():
             if address == val[1]:
                 val[0].callback((False, None))
+                if self._outstanding[msgID][2].active():
+                    self._outstanding[msgID][2].cancel()
                 del self._outstanding[msgID]
+
+        self.router.removeContact(node)
+        try:
+            self.multiplexer[address].shutdown()
+        except Exception:
+            pass
 
     def rpc_hole_punch(self, sender, ip, port, relay="False"):
         """
@@ -157,7 +135,9 @@ class RPCProtocol:
         the other node to punch through our NAT.
         """
         if relay == "True":
-            self.hole_punch((ip, int(port)), sender.ip, sender.port)
+            self.log.debug("relaying hole punch packet to %s:%s for %s:%s" %
+                           (ip, port, sender.ip, str(sender.port)))
+            self.hole_punch(Node(digest("null"), ip, int(port), nat_type=FULL_CONE), sender.ip, sender.port)
         else:
             self.log.debug("punching through NAT for %s:%s" % (ip, port))
             # pylint: disable=W0612
@@ -173,7 +153,9 @@ class RPCProtocol:
         except AttributeError:
             pass
 
-        def func(address, *args):
+        def func(node, *args):
+            address = (node.ip, node.port)
+
             msgID = sha1(str(random.getrandbits(255))).digest()
             m = Message()
             m.messageID = msgID
@@ -183,18 +165,30 @@ class RPCProtocol:
             for arg in args:
                 m.arguments.append(str(arg))
             m.testnet = self.multiplexer.testnet
+            m.signature = self.signing_key.sign(m.SerializeToString())[:64]
             data = m.SerializeToString()
+
+            relay_addr = None
+            if node.nat_type == SYMMETRIC or \
+                    (node.nat_type == RESTRICTED and self.sourceNode.nat_type == SYMMETRIC):
+                relay_addr = node.relay_node
+
             d = defer.Deferred()
-            if name != "hole_punch":
-                seed = SEED_NODE_TESTNET if self.multiplexer.testnet else SEED_NODE
-                hole_punch = reactor.callLater(3, self.hole_punch, seed, address[0], address[1], "True")
-                if address in self.multiplexer:
-                    hole_punch.cancel()
-                self._outstanding[msgID] = [d, address, hole_punch]
+            if m.command != HOLE_PUNCH:
+                timeout = reactor.callLater(self._waitTimeout, self.timeout, node)
+                self._outstanding[msgID] = [d, address, timeout]
                 self.log.debug("calling remote function %s on %s (msgid %s)" % (name, address, b64encode(msgID)))
-            else:
-                self.log.debug("sending hole punch message to %s" % args[0] + ":" + str(args[1]))
-            self.multiplexer.send_message(data, address)
+
+            self.multiplexer.send_message(data, address, relay_addr)
+
+            if self.multiplexer[address].state != State.CONNECTED and \
+                            node.nat_type == RESTRICTED and \
+                            self.sourceNode.nat_type != SYMMETRIC and \
+                            node.relay_node is not None:
+                self.hole_punch(Node(digest("null"), node.relay_node[0], node.relay_node[1], nat_type=FULL_CONE),
+                                address[0], address[1], "True")
+                self.log.debug("sending hole punch message to %s" % address[0] + ":" + str(address[1]))
+
             return d
 
         return func

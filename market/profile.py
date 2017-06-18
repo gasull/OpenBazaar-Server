@@ -13,9 +13,9 @@ class Profile(object):
 
     def __init__(self, db):
         self.profile = objects.Profile()
-        self.db = db.ProfileStore()
-        if self.db.get_proto() is not None:
-            self.profile.ParseFromString(self.db.get_proto())
+        self.db = db
+        if self.db.profile.get_proto() is not None:
+            self.profile.ParseFromString(self.db.profile.get_proto())
 
     def get(self, serialized=False):
         if serialized:
@@ -33,26 +33,35 @@ class Profile(object):
             update(u)
         """
         self.profile.MergeFrom(user_info)
-        self.db.set_proto(self.profile.SerializeToString())
+        self.db.profile.set_proto(self.profile.SerializeToString())
 
     def add_social_account(self, account_type, username, proof=None):
         s = self.profile.SocialAccount()
-        for social_account in self.profile.social:
-            if social_account.type == s.SocialType.Value(account_type.upper()):
-                self.profile.social.remove(social_account)
-        s.type = s.SocialType.Value(account_type.upper())
-        s.username = username
-        if proof:
-            s.proof_url = proof
-        self.profile.social.extend([s])
-        self.db.set_proto(self.profile.SerializeToString())
+        try:
+            self._remove_social_if_found(account_type)
+            s.type = s.SocialType.Value(account_type.upper())
+            s.username = username
+            if proof:
+                s.proof_url = proof
+            self.profile.social.extend([s])
+        except ValueError:
+            return
+        self.db.profile.set_proto(self.profile.SerializeToString())
 
     def remove_social_account(self, account_type):
+        try:
+            self._remove_social_if_found(account_type)
+        except ValueError:
+            return
+        self.db.profile.set_proto(self.profile.SerializeToString())
+
+    def _remove_social_if_found(self, account_type):
         s = self.profile.SocialAccount()
+        st = s.SocialType.Value(account_type.upper())
         for social_account in self.profile.social:
-            if social_account.type == s.SocialType.Value(account_type.upper()):
+            if social_account.type == st:
                 self.profile.social.remove(social_account)
-        self.db.set_proto(self.profile.SerializeToString())
+        self.db.profile.set_proto(self.profile.SerializeToString())
 
     def add_pgp_key(self, public_key, signature, guid):
         """
@@ -67,7 +76,7 @@ class Profile(object):
             p.public_key = public_key
             p.signature = signature
             self.profile.pgp_key.MergeFrom(p)
-            self.db.set_proto(self.profile.SerializeToString())
+            self.db.profile.set_proto(self.profile.SerializeToString())
             return True
         else:
             return False
@@ -75,4 +84,7 @@ class Profile(object):
     def remove_field(self, field):
         if field is not "name":
             self.profile.ClearField(field)
-            self.db.set_proto(self.profile.SerializeToString())
+            self.db.profile.set_proto(self.profile.SerializeToString())
+
+    def get_temp_handle(self):
+        return self.db.profile.get_temp_handle()

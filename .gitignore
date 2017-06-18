@@ -59,3 +59,12 @@ target/
 
 .idea/
 _trial_temp/
+
+# Docker data
+data/
+
+# SSL
+ssl/
+
+# Config
+.env

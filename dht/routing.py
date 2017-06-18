@@ -148,7 +148,14 @@ class RoutingTable(object):
         index = self.getBucketFor(node)
         return self.buckets[index].isNewNode(node)
 
+    def checkAndRemoveDuplicate(self, node):
+        for bucket in self.buckets:
+            for n in bucket.getNodes():
+                if (n.ip, n.port) == (node.ip, node.port) and n.id != node.id:
+                    self.removeContact(n)
+
     def addContact(self, node):
+        self.checkAndRemoveDuplicate(node)
         index = self.getBucketFor(node)
         bucket = self.buckets[index]
 
@@ -176,7 +183,7 @@ class RoutingTable(object):
         k = k or self.ksize
         nodes = []
         for neighbor in TableTraverser(self, node):
-            if neighbor.id != node.id and (exclude is None or not neighbor.sameHomeAs(exclude)):
+            if exclude is None or not neighbor.sameHomeAs(exclude):
                 heapq.heappush(nodes, (node.distanceTo(neighbor), neighbor))
             if len(nodes) == k:
                 break

@@ -3,7 +3,7 @@ Copyright (c) 2014 Brian Muller
 Copyright (c) 2015 OpenBazaar
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
 from twisted.internet import defer
 
 from log import Logger
@@ -45,7 +45,7 @@ class SpiderCrawl(object):
         Get either a value or list of nodes.
 
         Args:
-            rpcmethod: The protocol's callfindValue or callFindNode.
+            rpcmethod: The protocol's callFindValue or callFindNode.
 
         The process:
           1. calls find_* to current ALPHA nearest not already queried nodes,
@@ -71,11 +71,12 @@ class SpiderCrawl(object):
 
 
 class ValueSpiderCrawl(SpiderCrawl):
-    def __init__(self, protocol, node, peers, ksize, alpha):
+    def __init__(self, protocol, node, peers, ksize, alpha, save_at_nearest=True):
         SpiderCrawl.__init__(self, protocol, node, peers, ksize, alpha)
         # keep track of the single nearest node without value - per
         # section 2.3 so we can set the key there if found
         self.nearestWithoutValue = NodeHeap(self.node, 1)
+        self.saveToNearestWitoutValue = save_at_nearest
 
     def find(self):
         """
@@ -94,7 +95,8 @@ class ValueSpiderCrawl(SpiderCrawl):
             if not response.happened():
                 toremove.append(peerid)
             elif response.hasValue():
-                foundValues.append(response.getValue())
+                # since we get back a list of values, we will just extend foundValues (excluding duplicates)
+                foundValues = list(set(foundValues) | set(response.getValue()))
             else:
                 peer = self.nearest.getNodeById(peerid)
                 self.nearestWithoutValue.push(peer)
@@ -115,27 +117,53 @@ class ValueSpiderCrawl(SpiderCrawl):
         make sure we tell the nearest node that *didn't* have
         the value to store it.
         """
-        valueCounts = Counter(values)
-        if len(valueCounts) != 1:
-            args = (self.node.long_id, str(values))
-            self.log.warning("got multiple values for key %i: %s" % args)
-        value = valueCounts.most_common(1)[0][0]
 
-        ds = []
-        peerToSaveTo = self.nearestWithoutValue.popleft()
-        if peerToSaveTo is not None:
-            for v in value:
-                try:
-                    val = objects.Value()
-                    val.ParseFromString(v)
-                    ds.append(self.protocol.callStore(peerToSaveTo, self.node.id, val.valueKey, val.serializedData))
-                except Exception:
-                    pass
-            return defer.gatherResults(ds).addCallback(lambda _: value)
+        value_dict = defaultdict(list)
+        ttl_dict = defaultdict(list)
+        for v in values:
+            try:
+                d = objects.Value()
+                d.ParseFromString(v)
+                value_dict[d.valueKey].append(d.serializedData)
+                ttl_dict[d.valueKey].append(d.ttl)
+            except Exception:
+                pass
+        value = []
+        for k, v in value_dict.items():
+            ttl = ttl_dict[k]
+            if len(v) > 1:
+                valueCounts = Counter(v)
+                v = [valueCounts.most_common(1)[0][0]]
+                ttlCounts = Counter(ttl_dict[k])
+                ttl = [ttlCounts.most_common(1)[0][0]]
+            val = objects.Value()
+            val.valueKey = k
+            val.serializedData = v[0]
+            val.ttl = ttl[0]
+            value.append(val.SerializeToString())
+
+        if self.saveToNearestWitoutValue:
+            ds = []
+            peerToSaveTo = self.nearestWithoutValue.popleft()
+            if peerToSaveTo is not None:
+                for v in value:
+                    try:
+                        val = objects.Value()
+                        val.ParseFromString(v)
+                        ds.append(self.protocol.callStore(peerToSaveTo, self.node.id, val.valueKey,
+                                                          val.serializedData, val.ttl))
+                    except Exception:
+                        pass
+                return defer.gatherResults(ds).addCallback(lambda _: value)
         return value
 
 
 class NodeSpiderCrawl(SpiderCrawl):
+
+    def __init__(self, protocol, node, peers, ksize, alpha, find_exact=False):
+        SpiderCrawl.__init__(self, protocol, node, peers, ksize, alpha)
+        self.find_exact = find_exact
+
     def find(self):
         """
         Find the closest nodes.
@@ -152,7 +180,12 @@ class NodeSpiderCrawl(SpiderCrawl):
             if not response.happened():
                 toremove.append(peerid)
             else:
-                self.nearest.push(response.getNodeList())
+                node_list = response.getNodeList()
+                self.nearest.push(node_list)
+                if self.find_exact:
+                    for node in node_list:
+                        if node.id == self.node.id:
+                            return [node]
         self.nearest.remove(toremove)
 
         if self.nearest.allBeenContacted():
@@ -197,7 +230,10 @@ class RPCFindResponse(object):
             try:
                 n = objects.Node()
                 n.ParseFromString(node)
-                newNode = Node(n.guid, n.ip, n.port, signed_pubkey=n.signedPublicKey, vendor=n.vendor)
+                newNode = Node(n.guid, n.nodeAddress.ip, n.nodeAddress.port, n.publicKey,
+                               None if not n.HasField("relayAddress") else (n.relayAddress.ip, n.relayAddress.port),
+                               n.natType,
+                               n.vendor)
                 nodes.append(newNode)
             except Exception:
                 pass
